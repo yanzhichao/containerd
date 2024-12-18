@@ -17,12 +17,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/containerd/log"
@@ -52,6 +56,25 @@ import (
 func init() {
 	typeurl.Register(&containerstore.Metadata{},
 		"github.com/containerd/cri/pkg/store/container", "Metadata")
+}
+
+func (c *criService) actuatorCmdWithEnv(name string, envs []string, arg ...string) (code int, err error) {
+	command := exec.Command(name, arg...)
+	command.Env = envs
+	outinfo := bytes.Buffer{}
+	command.Stdout = &outinfo
+	var cmdExitStatus int
+	err = command.Run()
+	if err != nil {
+		if ex, ok := err.(*exec.ExitError); ok {
+			cmdExitStatus = ex.Sys().(syscall.WaitStatus).ExitStatus()
+		}
+
+		if cmdExitStatus == 0 {
+			return -1, err
+		}
+	}
+	return cmdExitStatus, err
 }
 
 // CreateContainer creates a new container in the given PodSandbox.
@@ -117,6 +140,37 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve image %q: %w", config.GetImage().GetImage(), err)
 	}
+
+	namespace := r.GetSandboxConfig().Metadata.GetNamespace()
+	if namespace != "kube-system" {
+		//do remote attestation
+		splitId := strings.Split(image.ID, ":")
+		if len(splitId) != 2 {
+			return nil, fmt.Errorf("image id format error")
+		}
+		log.G(ctx).Debugf("image id :%s try to do attest", splitId[1])
+
+		kbsEndpoint, ok := r.GetSandboxConfig().Annotations["kbs-endpoint"]
+		if !ok {
+			log.G(ctx).WithError(err).Errorf("kbs-endpoint is not set in pod's annotations")
+			return nil, fmt.Errorf("kbs-endpoint is null, you should config [kbs-endoint] in pod.template.metadata.annotations")
+		}
+
+		log.G(ctx).Debugf("kbs endpoint: %s", kbsEndpoint)
+
+		var envs []string
+		envs = append(envs, fmt.Sprintf("appId=%s", splitId[1]))
+		envs = append(envs, fmt.Sprintf("kbsEndpoint=%s", kbsEndpoint))
+		errCode, err := c.actuatorCmdWithEnv("/workplace/cvm-agent/cvmassistants/secretprovider/secret_provider_agent", envs, "-v", "nullverifier", "-f", "-s", path.Join("/secret", fmt.Sprintf("secret-%s.json", splitId[1])))
+		if errCode != 0 {
+			msg := fmt.Sprintf("get secret failed, error: %s, errcode: %d", err.Error(), errCode)
+			log.G(ctx).Errorf(msg)
+			return nil, fmt.Errorf(msg)
+		}
+	} else {
+		log.G(ctx).Debugf("namespace is %s, skip to do attestation ", namespace)
+	}
+
 	containerdImage, err := c.toContainerdImage(ctx, image)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
